@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/xuri/excelize/v2"
@@ -15,9 +14,13 @@ func main() {
 	var inFile string
 	var outFile string
 	var sheet string
+	var onlyDiff bool
+
 	flag.StringVar(&inFile, "in", "", "input xlsx file")
 	flag.StringVar(&outFile, "out", "updates.sql", "output sql file")
 	flag.StringVar(&sheet, "sheet", "", "sheet name (default first sheet)")
+	flag.BoolVar(&onlyDiff, "only-diff", true,
+		"generate UPDATE with condition to update only when name differs")
 	flag.Parse()
 
 	if inFile == "" {
@@ -37,33 +40,40 @@ func main() {
 		sheet = sheets[0]
 	}
 
-	updates, err := generateUpdates(f, sheet)
+	updates, err := loadRows(f, sheet)
 	if err != nil {
-		log.Fatalf("generate updates: %v", err)
+		log.Fatalf("load rows: %v", err)
 	}
 
-	if err := writeSQL(outFile, updates); err != nil {
+	vals, count := buildValuesClause(updates)
+	log.Printf("Collected %d value(s) from sheet %q", count, sheet)
+
+	if err := writeValuesSQL(outFile, vals, onlyDiff); err != nil {
 		log.Fatalf("write sql: %v", err)
 	}
 
-	log.Printf("Done: generated %s (%d updates)", outFile, len(updates))
+	log.Printf("Done: generated %s with %d values", outFile, count)
 }
 
+// esc экранирует одинарные кавычки для вставки в SQL литерал.
 func esc(s string) string {
-	// эскейп для SQL строк: одинарная кавычка -> два одинарных
 	return strings.ReplaceAll(s, "'", "''")
 }
 
-// generateUpdates читает переданный excelize.File и sheet и возвращает slice SQL UPDATE строк.
-// Поведение соответствует предыдущей реализации: пропускает заголовок (первая строка),
-// пропускает строки с < 3 колонками или пустыми code/shortName.
-func generateUpdates(f *excelize.File, sheet string) ([]string, error) {
+func loadRows(f *excelize.File, sheet string) ([][]string, error) {
 	rows, err := f.GetRows(sheet)
 	if err != nil {
 		return nil, fmt.Errorf("get rows: %w", err)
 	}
+	return rows, nil
+}
 
-	var updates []string
+// buildValuesClause принимает строки excel (в формате GetRows) и возвращает
+// массив value-строк для VALUES ('code','name').
+// Ожидает: первая строка - заголовок; колонки: A=code, B=nameFull(игнор), C=shortName
+func buildValuesClause(rows [][]string) ([]string, int) {
+	var vals []string
+	count := 0
 	for i, r := range rows {
 		if i == 0 {
 			// предполагаем, что первая строка — заголовок
@@ -74,8 +84,7 @@ func generateUpdates(f *excelize.File, sheet string) ([]string, error) {
 			continue
 		}
 		code := strings.TrimSpace(r[0])
-		shortName := strings.TrimSpace(r[2]) // краткое наименование
-
+		shortName := strings.TrimSpace(r[2])
 		if code == "" || shortName == "" {
 			continue
 		}
@@ -83,24 +92,14 @@ func generateUpdates(f *excelize.File, sheet string) ([]string, error) {
 		escShort := esc(shortName)
 		escCode := esc(code)
 
-		update := fmt.Sprintf(
-			"UPDATE documents\nSET data = jsonb_set(data, '{name}', to_jsonb('%s'::text), false)\nWHERE data->>'code' = '%s';",
-			escShort, escCode,
-		)
-		updates = append(updates, update)
+		val := fmt.Sprintf("('%s','%s')", escCode, escShort)
+		vals = append(vals, val)
+		count++
 	}
-
-	return updates, nil
+	return vals, count
 }
 
-// writeSQL создает выходной файл и записывает BEGIN; updates... COMMIT;
-func writeSQL(outFile string, updates []string) error {
-	dir := filepath.Dir(outFile)
-	if dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("mkdir out dir: %w", err)
-		}
-	}
+func writeValuesSQL(outFile string, vals []string, onlyDiff bool) error {
 	of, err := os.Create(outFile)
 	if err != nil {
 		return fmt.Errorf("create out file: %w", err)
@@ -108,9 +107,44 @@ func writeSQL(outFile string, updates []string) error {
 	defer of.Close()
 
 	fmt.Fprintln(of, "BEGIN;")
-	for _, u := range updates {
-		fmt.Fprintln(of, u)
+	fmt.Fprintln(of)
+
+	// Если нет значений — ничего не делаем
+	if len(vals) == 0 {
+		fmt.Fprintln(of, "-- no values generated from Excel")
+		fmt.Fprintln(of)
+		fmt.Fprintln(of, "COMMIT;")
+		return nil
 	}
+
+	// Печатаем WITH vals(code, name) AS ( VALUES
+	//	VALUES... )
+	fmt.Fprintln(of, "WITH vals(code, name) AS (")
+	fmt.Fprintln(of, "VALUES")
+	// join с запятой и переносом строк
+	for i, v := range vals {
+		sep := ","
+		if i == len(vals)-1 {
+			sep = ""
+		}
+		fmt.Fprintf(of, "    %s%s\n", v, sep)
+	}
+	fmt.Fprintln(of, ")")
+	fmt.Fprintln(of)
+
+	// Основной UPDATE: один проход
+	// Добавляем условие onlyDiff если нужно
+	fmt.Fprintln(of, "UPDATE documents d")
+	fmt.Fprintln(of, "SET data = jsonb_set(d.data, '{name}', to_jsonb(v.name::text), false)")
+	fmt.Fprintln(of, "FROM vals v")
+	fmt.Fprint(of, "WHERE d.data->>'code' = v.code")
+	if onlyDiff {
+		fmt.Fprintln(of, " AND d.data->>'name' IS DISTINCT FROM v.name;")
+	} else {
+		fmt.Fprintln(of, ";")
+	}
+
+	fmt.Fprintln(of)
 	fmt.Fprintln(of, "COMMIT;")
 	return nil
 }
