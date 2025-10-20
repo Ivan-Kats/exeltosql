@@ -58,3 +58,5 @@ data/
 
 .gomodcache/
 meroving-config.json
+xlsxs/
+sqls/
